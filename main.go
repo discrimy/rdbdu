@@ -78,23 +78,6 @@ func (n *Node) HasChildren() bool {
 }
 
 var uuidRe = regexp.MustCompile(`^[0-9a-fA-F]{8}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{12}$`)
-var ipRe = regexp.MustCompile(`^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$`)
-
-func isValidIPv4(s string) bool {
-	for _, octet := range strings.SplitN(s, ".", 4) {
-		n := 0
-		for _, r := range octet {
-			if r < '0' || r > '9' {
-				return false
-			}
-			n = n*10 + int(r-'0')
-		}
-		if n > 255 {
-			return false
-		}
-	}
-	return true
-}
 
 func normalize(s string) string {
 	if s == "" {
@@ -113,9 +96,6 @@ func normalize(s string) string {
 	if uuidRe.MatchString(s) {
 		return "<uuid>"
 	}
-	if ipRe.MatchString(s) && isValidIPv4(s) {
-		return "<ip>"
-	}
 	if len(s) >= 16 {
 		allHex := true
 		for _, r := range s {
@@ -131,7 +111,7 @@ func normalize(s string) string {
 	return s
 }
 
-func insert(root *Node, key string, size int64, typeStr string, sep string, maxDepth int, doNormalize bool) {
+func insert(root *Node, key string, size int64, typeStr string, sep string, maxDepth int, doNormalize bool, collapseThreshold int) {
 	parts := strings.Split(key, sep)
 	if len(parts) > maxDepth {
 		parts = parts[:maxDepth]
@@ -154,8 +134,23 @@ func insert(root *Node, key string, size int64, typeStr string, sep string, maxD
 		}
 		c, ok := n.Children[p]
 		if !ok {
-			c = &Node{Name: p, Parent: n}
-			n.Children[p] = c
+			// Inline collapse: when this node already has threshold distinct
+			// children and a new segment arrives, redirect it into the <*>
+			// bucket instead of creating yet another child.  This bounds the
+			// number of children per node to threshold+1 at all times, so RAM
+			// never explodes even when a prefix has millions of distinct keys
+			// that don't match normalization patterns.
+			if collapseThreshold > 0 && len(n.Children) >= collapseThreshold && p != "<*>" {
+				star, starOk := n.Children["<*>"]
+				if !starOk {
+					star = &Node{Name: "<*>", Parent: n}
+					n.Children["<*>"] = star
+				}
+				c = star
+			} else {
+				c = &Node{Name: p, Parent: n}
+				n.Children[p] = c
+			}
 		}
 		c.Size += size
 		c.Count++
@@ -166,81 +161,6 @@ func insert(root *Node, key string, size int64, typeStr string, sep string, maxD
 			c.Types[typeStr] = struct{}{}
 		}
 		n = c
-	}
-}
-
-// collapseTree walks the tree bottom-up and merges excess children into a <*>
-// bucket. When a node has more than threshold children, the smallest ones are
-// merged into a single <*> child that aggregates their size, count, types, and
-// recursively merges their subtrees. This prevents RAM explosion when a prefix
-// has many distinct key segments that don't match known normalization patterns.
-func collapseTree(n *Node, threshold int) {
-	if threshold <= 0 || n.Children == nil {
-		return
-	}
-	// Recurse first so deeper levels are already collapsed.
-	for _, c := range n.Children {
-		collapseTree(c, threshold)
-	}
-	// Separate existing <*> (if any) from regular children.
-	var regular []*Node
-	var star *Node
-	for _, c := range n.Children {
-		if c.Name == "<*>" {
-			star = c
-		} else {
-			regular = append(regular, c)
-		}
-	}
-	if len(regular) <= threshold {
-		return
-	}
-	sort.Slice(regular, func(i, j int) bool { return regular[i].Size > regular[j].Size })
-	keep := threshold
-	if keep < 1 {
-		keep = 1
-	}
-	if star == nil {
-		star = &Node{Name: "<*>", Parent: n}
-	}
-	for _, c := range regular[keep:] {
-		mergeInto(star, c)
-	}
-	// Collapse the <*> node's own children (merged subtrees may be large).
-	collapseTree(star, threshold)
-	// Rebuild children map.
-	newChildren := make(map[string]*Node, keep+1)
-	for _, c := range regular[:keep] {
-		newChildren[c.Name] = c
-	}
-	newChildren["<*>"] = star
-	n.Children = newChildren
-}
-
-// mergeInto merges src's subtree into dst, summing size/count, unioning types,
-// and recursively merging children by name.
-func mergeInto(dst, src *Node) {
-	dst.Size += src.Size
-	dst.Count += src.Count
-	for t := range src.Types {
-		if dst.Types == nil {
-			dst.Types = make(map[string]struct{})
-		}
-		dst.Types[t] = struct{}{}
-	}
-	if src.Children == nil {
-		return
-	}
-	if dst.Children == nil {
-		dst.Children = make(map[string]*Node)
-	}
-	for name, sc := range src.Children {
-		dc, ok := dst.Children[name]
-		if !ok {
-			dc = &Node{Name: name, Parent: dst}
-			dst.Children[name] = dc
-		}
-		mergeInto(dc, sc)
 	}
 }
 
@@ -545,7 +465,7 @@ func main() {
 	flag.IntVar(&maxDepth, "depth", 8, "max key depth to track")
 	flag.BoolVar(&raw, "raw", false, "disable normalization of numeric/uuid/hex/ip segments")
 	flag.IntVar(&topN, "top", 1000, "max children shown per level (sorted by size desc)")
-	flag.IntVar(&collapse, "collapse", 0, "collapse nodes with more than N children into <*> bucket (0=disabled)")
+	flag.IntVar(&collapse, "collapse", 1000, "collapse nodes with more than N children into <*> bucket (0=disabled)")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [flags] dump.rdb\n\nFlags:\n", os.Args[0])
 		flag.PrintDefaults()
@@ -576,17 +496,13 @@ func main() {
 	dec := parser.NewDecoder(cr)
 	err = dec.Parse(func(o model.RedisObject) bool {
 		atomic.AddInt64(&keys, 1)
-		insert(root, o.GetKey(), int64(o.GetSize()), o.GetType(), sep, maxDepth, !raw)
+		insert(root, o.GetKey(), int64(o.GetSize()), o.GetType(), sep, maxDepth, !raw, collapse)
 		return true
 	})
 	close(stop)
 	fmt.Fprintln(os.Stderr)
 	if err != nil {
 		fatal(err)
-	}
-
-	if collapse > 0 {
-		collapseTree(root, collapse)
 	}
 
 	runTUI(root, topN)
