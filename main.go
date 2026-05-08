@@ -169,6 +169,81 @@ func insert(root *Node, key string, size int64, typeStr string, sep string, maxD
 	}
 }
 
+// collapseTree walks the tree bottom-up and merges excess children into a <*>
+// bucket. When a node has more than threshold children, the smallest ones are
+// merged into a single <*> child that aggregates their size, count, types, and
+// recursively merges their subtrees. This prevents RAM explosion when a prefix
+// has many distinct key segments that don't match known normalization patterns.
+func collapseTree(n *Node, threshold int) {
+	if threshold <= 0 || n.Children == nil {
+		return
+	}
+	// Recurse first so deeper levels are already collapsed.
+	for _, c := range n.Children {
+		collapseTree(c, threshold)
+	}
+	// Separate existing <*> (if any) from regular children.
+	var regular []*Node
+	var star *Node
+	for _, c := range n.Children {
+		if c.Name == "<*>" {
+			star = c
+		} else {
+			regular = append(regular, c)
+		}
+	}
+	if len(regular) <= threshold {
+		return
+	}
+	sort.Slice(regular, func(i, j int) bool { return regular[i].Size > regular[j].Size })
+	keep := threshold
+	if keep < 1 {
+		keep = 1
+	}
+	if star == nil {
+		star = &Node{Name: "<*>", Parent: n}
+	}
+	for _, c := range regular[keep:] {
+		mergeInto(star, c)
+	}
+	// Collapse the <*> node's own children (merged subtrees may be large).
+	collapseTree(star, threshold)
+	// Rebuild children map.
+	newChildren := make(map[string]*Node, keep+1)
+	for _, c := range regular[:keep] {
+		newChildren[c.Name] = c
+	}
+	newChildren["<*>"] = star
+	n.Children = newChildren
+}
+
+// mergeInto merges src's subtree into dst, summing size/count, unioning types,
+// and recursively merging children by name.
+func mergeInto(dst, src *Node) {
+	dst.Size += src.Size
+	dst.Count += src.Count
+	for t := range src.Types {
+		if dst.Types == nil {
+			dst.Types = make(map[string]struct{})
+		}
+		dst.Types[t] = struct{}{}
+	}
+	if src.Children == nil {
+		return
+	}
+	if dst.Children == nil {
+		dst.Children = make(map[string]*Node)
+	}
+	for name, sc := range src.Children {
+		dc, ok := dst.Children[name]
+		if !ok {
+			dc = &Node{Name: name, Parent: dst}
+			dst.Children[name] = dc
+		}
+		mergeInto(dc, sc)
+	}
+}
+
 // TypeString returns a comma-separated sorted list of Redis types under this node.
 func (n *Node) TypeString() string {
 	if len(n.Types) == 0 {
@@ -378,7 +453,9 @@ func (u *ui) render() {
 			pct = 100 * float64(c.Size) / float64(parentSize)
 		}
 		nameColor := tcell.ColorWhite
-		if c.HasChildren() {
+		if c.Name == "<*>" {
+			nameColor = tcell.ColorOrange
+		} else if c.HasChildren() {
 			nameColor = tcell.ColorAqua
 		}
 
@@ -462,11 +539,13 @@ func main() {
 		maxDepth int
 		raw      bool
 		topN     int
+		collapse int
 	)
 	flag.StringVar(&sep, "sep", ":", "key separator")
 	flag.IntVar(&maxDepth, "depth", 8, "max key depth to track")
 	flag.BoolVar(&raw, "raw", false, "disable normalization of numeric/uuid/hex/ip segments")
 	flag.IntVar(&topN, "top", 1000, "max children shown per level (sorted by size desc)")
+	flag.IntVar(&collapse, "collapse", 0, "collapse nodes with more than N children into <*> bucket (0=disabled)")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [flags] dump.rdb\n\nFlags:\n", os.Args[0])
 		flag.PrintDefaults()
@@ -504,6 +583,10 @@ func main() {
 	fmt.Fprintln(os.Stderr)
 	if err != nil {
 		fatal(err)
+	}
+
+	if collapse > 0 {
+		collapseTree(root, collapse)
 	}
 
 	runTUI(root, topN)
